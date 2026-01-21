@@ -1,0 +1,14 @@
+<launch>
+
+	<arg name="rviz" default="true" />
+
+	<rosparam command="load" file="$(find rt_livo)/config/HILTI22.yaml" />
+
+	<node pkg="rt_livo" type="rtlivo_mapping" name="laserMapping" output="screen">
+		<rosparam file="$(find rt_livo)/config/camera_fisheye_HILTI22.yaml" />
+	</node>
+
+	<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find rt_livo)/rviz_cfg/hilti.rviz" />
+	</group>
+</launch> 	
