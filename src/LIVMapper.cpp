@@ -384,23 +384,15 @@ void LIVMapper::handleLIO()
            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << std::endl;
 
   // ==========================================
-  // [关键修复] 在 LIO 处理前，使用对应的图像更新 Mask
+  // [关键修复] Mask已在主循环中更新（行703），这里只需要验证
   // ==========================================
-  if (rtdetr_en && !LidarMeasures.measures.empty() && !LidarMeasures.measures.back().img.empty())
-  {
-      cv::Mat img_for_mask = LidarMeasures.measures.back().img.clone();
-      ROS_INFO("[LIO] Using image from measures, size: %dx%d", img_for_mask.rows, img_for_mask.cols);
-      DetectAndMask(img_for_mask);
-
-      // 验证 Mask 是否包含黑色区域
-      if (rtdetr_en && !current_mask_.empty()) {
+  if (rtdetr_en) {
+      if (!current_mask_.empty()) {
           double mean_val = cv::mean(current_mask_)[0];
-          ROS_INFO("[LIO] After DetectAndMask: Mask mean: %.2f, size: %dx%d", mean_val, current_mask_.rows, current_mask_.cols);
+          ROS_DEBUG("[LIO] Using current_mask: mean=%.2f, size=%dx%d", mean_val, current_mask_.rows, current_mask_.cols);
+      } else {
+          ROS_WARN_THROTTLE(1.0, "[LIO] current_mask_ is EMPTY! Check if image was processed in main loop.");
       }
-  } else {
-      ROS_WARN("[LIO] No image available for Mask generation! measures.empty=%d, img.empty=%d",
-               LidarMeasures.measures.empty(),
-               LidarMeasures.measures.empty() ? true : LidarMeasures.measures.back().img.empty());
   }
   // ==========================================
 
@@ -700,7 +692,13 @@ void LIVMapper::run()
     }
 
     if (!LidarMeasures.measures.empty() && !LidarMeasures.measures.back().img.empty()) {
+        ROS_DEBUG("[Main] Processing image for mask detection: %dx%d",
+                  LidarMeasures.measures.back().img.rows,
+                  LidarMeasures.measures.back().img.cols);
         DetectAndMask(LidarMeasures.measures.back().img);
+    } else if (rtdetr_en) {
+        ROS_WARN_THROTTLE(1.0, "[Main] No image available! measures.empty=%d",
+                         LidarMeasures.measures.empty());
     }
 
     handleFirstFrame();
@@ -1113,7 +1111,12 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
       m.imu.clear();
       m.lio_time = img_capture_time;
+
+      // [关键修复] 保存图像并从buffer中移除，确保mask和点云时间戳匹配
       mtx_buffer.lock();
+      m.img = img_buffer.front();
+      img_buffer.pop_front();
+      img_time_buffer.pop_front();
       while (!imu_buffer.empty())
       {
         if (imu_buffer.front()->header.stamp.toSec() > m.lio_time) break;
@@ -1419,11 +1422,30 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
               pointRGB.g = pixel[1];
               pointRGB.b = pixel[0];
               if (pf.norm() > blind_rgb_points) laserCloudWorldRGB->push_back(pointRGB);
+          } else {
+              // [关键修复] 被mask过滤的点，标记为红色并添加到删除点云
+              if (pf.norm() > blind_rgb_points) {
+                  pointRGB.r = 255;
+                  pointRGB.g = 0;
+                  pointRGB.b = 0;
+                  if (feats_removed_accumulated_ == nullptr) {
+                      feats_removed_accumulated_.reset(new pcl::PointCloud<pcl::PointXYZRGB>());
+                  }
+                  feats_removed_accumulated_->points.push_back(pointRGB);
+              }
           }
           // -------------------------------------------------------
         } else {
             out_of_fov_points++;
         }
+      }
+
+      // [调试] 输出过滤统计
+      if (rtdetr_en && total_points > 0) {
+          ROS_INFO_THROTTLE(1.0, "[Publish] Filter: %d total, %d masked (%.1f%%), %d FOV, %d behind, %d no_frame",
+                           total_points, masked_out_points,
+                           100.0 * masked_out_points / total_points,
+                           out_of_fov_points, behind_camera_points, no_frame_points);
       }
     } // 【修复】这里之前漏掉了括号，导致 else 报错
     else
@@ -1627,6 +1649,13 @@ void LIVMapper::DetectAndMask(cv::Mat& img)
 {
     if (!rtdetr_en || detector_ == nullptr) return;
 
+    // 获取相机模型的实际尺寸（考虑了scale）
+    int cam_width = vio_manager->cam->width();
+    int cam_height = vio_manager->cam->height();
+
+    ROS_DEBUG("[Detect] Input image: %dx%d, Camera model: %dx%d",
+              img.cols, img.rows, cam_width, cam_height);
+
     cv::Mat temp_mask(img.size(), CV_8UC1);
     temp_mask.setTo(255);
 
@@ -1655,15 +1684,20 @@ void LIVMapper::DetectAndMask(cv::Mat& img)
     }
 
     // ==========================================
-    // [关键修复] 缩放 Mask 以匹配 VIO 处理的图像尺寸
+    // [关键修复] 将mask缩放到与相机模型一致的尺寸
     // ==========================================
-    // VIO 会将图像缩放为 640x360 (scale=0.5)
-    // 所以 Mask 也需要缩放到相同尺寸
+    // world2cam返回的像素坐标是基于cam->width() x cam->height()
+    // 所以mask也需要缩放到相同尺寸
     cv::Mat temp_mask_resized;
-    cv::resize(temp_mask, temp_mask_resized, cv::Size(0, 0), 0.5, 0.5, cv::INTER_NEAREST);
+    if (temp_mask.cols != cam_width || temp_mask.rows != cam_height) {
+        cv::resize(temp_mask, temp_mask_resized, cv::Size(cam_width, cam_height), 0, 0, cv::INTER_NEAREST);
+        ROS_DEBUG("[Detect] Resized mask from %dx%d to %dx%d (camera size)",
+                  temp_mask.cols, temp_mask.rows, cam_width, cam_height);
+    } else {
+        temp_mask_resized = temp_mask;  // 尺寸已匹配，无需缩放
+    }
 
-    // [新增] 形态学膨胀操作，扩大mask区域，确保覆盖更完整的物体
-    // 使用5x5的椭圆核进行膨胀，这样可以更好地覆盖边界
+    // 形态学膨胀操作，扩大mask区域，确保覆盖更完整的物体
     cv::Mat dilated_mask;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
     cv::dilate(temp_mask_resized, dilated_mask, kernel, cv::Point(-1,-1), 2);  // 膨胀2次

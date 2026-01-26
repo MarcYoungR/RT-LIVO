@@ -9,10 +9,10 @@ common:
 extrin_calib:
   extrinsic_T: [0.04165, 0.02326, -0.0284]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  Rcl: [0.00610193,-0.999863,-0.0154172,
-        -0.00615449,0.0153796,-0.999863,
-        0.999962,0.00619598,-0.0060598] 
-  Pcl: [0.0194384, 0.104689,-0.0251952]
+  Rcl: [0.0188866,-0.999509,0.0249917,
+        0.0363232,-0.0242937,-0.999045,
+        0.999162,0.0197764,0.0358465] 
+  Pcl: [-0.0260306, -0.0795783,0.00547908]
 
 time_offset: 
   imu_time_offset: 0.0
@@ -29,7 +29,7 @@ preprocess:
 vio:
   max_iterations: 5
   outlier_threshold: 1000 # 78 100 156 #100 200 500 700 infinite
-  img_point_cov: 100 # 100 1000 
+  img_point_cov: 1000 # 100 1000 
   patch_size: 8
   patch_pyrimid_level: 4
   normal_en: true
@@ -86,7 +86,7 @@ pcd_save:
   # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
 
 rtdetr:
-  enable: true              # 【关键】总开关，必须为 true
+  enable: false              # 【关键】总开关，必须为 true
   model_name: "model.onnx"  # 模型文件名，需在 weights 文件夹下
-  conf_thresh: 0.25         # 置信度阈值 (建议 0.25 - 0.45)
-  padding: 50               # 掩码膨胀像素 (建议 10 - 20)
+  conf_thresh: 0.6         # 置信度阈值 (建议 0.25 - 0.45)
+  padding: 80               # 掩码膨胀像素 (建议 10 - 20)，扩大检测框以覆盖边界
