@@ -66,9 +66,9 @@ uav:
   gravity_align_en: false
 
 publish:
-  dense_map_en: false
-  
-  pub_effect_point_en: false 
+  dense_map_en: true   # 【关键】启用密集地图，显示完整点云
+
+  pub_effect_point_en: false
   pub_plane_en: false
   pub_scan_num: 1
   blind_rgb_points: 0.0
@@ -78,15 +78,13 @@ evo:
   pose_output_en: false
 
 pcd_save:
-  pcd_save_en: false
-  colmap_output_en: false # need to set interval = -1
+  pcd_save_en: true     # 【启用PCD保存】设置为 true 即可保存点云地图
+  colmap_output_en: false
   filter_size_pcd: 0.15
-  interval: -1
-  # how many LiDAR frames saved in each pcd file;
-  # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+  interval: -1  
 
 rtdetr:
-  enable: false              # 【关键】总开关，必须为 true
+  enable: true              # 【关键】总开关，必须为 true
   model_name: "model.onnx"  # 模型文件名，需在 weights 文件夹下
   conf_thresh: 0.7         # 置信度阈值 (建议 0.6以上)
   padding: 15               # 掩码膨胀像素 (建议 10 - 20)，扩大检测框以覆盖边界

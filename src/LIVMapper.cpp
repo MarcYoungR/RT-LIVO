@@ -1488,16 +1488,23 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   laserCloudmsg.header.frame_id = "camera_init";
   pubLaserCloudFullRes.publish(laserCloudmsg);
 
-  // ... 下面的保存 PCD 代码保持不变 ...
+  // ==========================================
+  // [PCD保存] 累积点云数据用于保存
+  // ==========================================
   if (pcd_save_en)
   {
-    int size = feats_undistort->points.size();
-    // ... (省略 PCD 保存代码，这部分不用动) ...
-    // 为了节省篇幅，这里假设你保留了原有的 PCD 保存代码
-    // 请确保最后这一行存在：
-    if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
-    PointCloudXYZI().swap(*pcl_w_wait_pub);
+    if (img_en && laserCloudWorldRGB->size() > 0)
+    {
+      // 将彩色点云累积到pcl_wait_save
+      *pcl_wait_save += *laserCloudWorldRGB;
+    }
+    else if (!img_en && pcl_w_wait_pub->size() > 0)
+    {
+      // 将强度点云累积到pcl_wait_save_intensity
+      *pcl_wait_save_intensity += *pcl_w_wait_pub;
+    }
   }
+  // ==========================================
 }
 
 void LIVMapper::publish_visual_sub_map(const ros::Publisher &pubSubVisualMap)
