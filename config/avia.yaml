@@ -88,5 +88,5 @@ pcd_save:
 rtdetr:
   enable: false              # 【关键】总开关，必须为 true
   model_name: "model.onnx"  # 模型文件名，需在 weights 文件夹下
-  conf_thresh: 0.6         # 置信度阈值 (建议 0.25 - 0.45)
-  padding: 80               # 掩码膨胀像素 (建议 10 - 20)，扩大检测框以覆盖边界
+  conf_thresh: 0.7         # 置信度阈值 (建议 0.6以上)
+  padding: 15               # 掩码膨胀像素 (建议 10 - 20)，扩大检测框以覆盖边界
