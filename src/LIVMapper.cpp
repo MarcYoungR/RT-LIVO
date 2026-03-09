@@ -1602,7 +1602,15 @@ void LIVMapper::InitRTDETR(ros::NodeHandle &nh) {
         nh.param<int>("rtdetr/padding", rtdetr_padding, 10);
         nh.param<double>("rtdetr/time_offset", rtdetr_time_offset, 0.0);  // 读取时间戳偏移参数
 
+        // 读取自适应协方差参数
+        nh.param<bool>("rtdetr/adaptive_cov/enable", adaptive_img_cov_en, false);
+        nh.param<double>("rtdetr/adaptive_cov/min_value", adaptive_img_cov_min, 200.0);
+        nh.param<double>("rtdetr/adaptive_cov/max_value", adaptive_img_cov_max, 2000.0);
+
         ROS_INFO("[RT-DETR] time_offset: %.3f seconds", rtdetr_time_offset);
+        ROS_INFO("[RT-DETR] Adaptive Cov: %s (m=0: %.0f, m=1: %.0f)",
+                 adaptive_img_cov_en ? "ENABLED" : "DISABLED",
+                 adaptive_img_cov_min, adaptive_img_cov_max);
 
         // 过滤列表：人(0), 自行车(1), 车(2), 摩托(3), 公交(5), 卡车(7)
         rtdetr_filter_ids = {0, 1, 2, 3, 5, 7};
@@ -1710,6 +1718,46 @@ void LIVMapper::DetectAndMask(cv::Mat& img)
     cv::dilate(temp_mask_resized, dilated_mask, kernel, cv::Point(-1,-1), 2);  // 膨胀2次
 
     current_mask_ = dilated_mask;
+    // ==========================================
+
+    // ==========================================
+    // 【自适应 img_point_cov 计算】
+    // ==========================================
+    if (adaptive_img_cov_en && vio_manager != nullptr) {
+        // 计算 mask 中值为 0（动态区域）的像素数
+        cv::Mat dynamic_mask = (current_mask_ == 0);
+        int dynamic_pixels = cv::countNonZero(dynamic_mask);
+        int total_pixels = current_mask_.rows * current_mask_.cols;
+
+        // 计算面积比例 m = x / A
+        double m = static_cast<double>(dynamic_pixels) / total_pixels;
+
+        // 计算自适应协方差
+        // 使用对数函数: img_point_cov = min + (max - min) × log(1 + 100m) / log(101)
+        // 当 m=0 时: log(1) = 0 → img_point_cov = min
+        // 当 m=1 时: log(101) ≈ 4.615 → img_point_cov = max
+        double adaptive_cov;
+        if (m <= 0.0) {
+            // 无动态目标，使用最小值
+            adaptive_cov = adaptive_img_cov_min;
+        } else {
+            // 对数函数平滑过渡
+            double log_factor = std::log10(1.0 + 100.0 * m);
+            double log_max = std::log10(101.0);  // ≈ 2.0043
+            double normalized = log_factor / log_max;  // 归一化到 [0, 1]
+
+            // 线性插值: min + (max - min) × normalized
+            adaptive_cov = adaptive_img_cov_min + (adaptive_img_cov_max - adaptive_img_cov_min) * normalized;
+        }
+
+        // 更新 vio_manager 的 img_point_cov
+        double old_cov = vio_manager->img_point_cov;
+        vio_manager->img_point_cov = adaptive_cov;
+
+        // 输出调整信息（每秒一次，避免刷屏）
+        ROS_INFO_THROTTLE(1.0, "\033[1;33m[Adaptive Cov]\033[0m Dynamic ratio: %.4f%% → img_point_cov: %.1f (was %.1f, delta: %.1f, range: [%.0f, %.0f])",
+                           m * 100.0, adaptive_cov, old_cov, adaptive_cov - old_cov, adaptive_img_cov_min, adaptive_img_cov_max);
+    }
     // ==========================================
 
     // [调试日志] 确认 Mask 真的不是全黑

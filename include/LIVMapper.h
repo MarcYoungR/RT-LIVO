@@ -199,6 +199,11 @@ public:
   std::vector<int> rtdetr_filter_ids;  // 过滤类别列表
   double rtdetr_time_offset = 0.0;    // 【新增】时间戳偏移(秒)，用于对齐/cloud_registered的延迟
 
+  // --- 自适应 img_point_cov 参数 ---
+  bool adaptive_img_cov_en = false;         // 是否启用自适应调整
+  double adaptive_img_cov_min = 200.0;      // 无动态目标时的值 (m=0)
+  double adaptive_img_cov_max = 2000.0;     // 全覆盖时的值 (m=1)
+
   // --- 功能函数 ---
   void InitRTDETR(ros::NodeHandle &nh);   // 初始化：读取YAML并加载模型
   void DetectAndMask(cv::Mat& img); // 核心：执行检测并生成Mask
