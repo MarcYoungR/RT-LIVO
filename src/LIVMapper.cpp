@@ -1751,12 +1751,7 @@ void LIVMapper::DetectAndMask(cv::Mat& img)
         }
 
         // 更新 vio_manager 的 img_point_cov
-        double old_cov = vio_manager->img_point_cov;
         vio_manager->img_point_cov = adaptive_cov;
-
-        // 输出调整信息（每秒一次，避免刷屏）
-        ROS_INFO_THROTTLE(1.0, "\033[1;33m[Adaptive Cov]\033[0m Dynamic ratio: %.4f%% → img_point_cov: %.1f (was %.1f, delta: %.1f, range: [%.0f, %.0f])",
-                           m * 100.0, adaptive_cov, old_cov, adaptive_cov - old_cov, adaptive_img_cov_min, adaptive_img_cov_max);
     }
     // ==========================================
 

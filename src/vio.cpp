@@ -1535,6 +1535,7 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       G.setZero();
       H_T_H.block<6, 6>(0, 0) = H_sub_T * H_sub;
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+
       auto &&HTz = H_sub_T * z;
       auto vec = (*state_propagat) - (*state);
       G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
@@ -1699,6 +1700,7 @@ void VIOManager::updateState(cv::Mat img, int level)
       G.setZero();
       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+
       auto &&HTz = H_sub_T * z;
       // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
       auto vec = (*state_propagat) - (*state);
