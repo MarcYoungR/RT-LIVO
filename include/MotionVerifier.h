@@ -2,18 +2,23 @@
  * MotionVerifier: 真实运动验证模块 (RT-LIVO)
  *
  * 设计目标:
- *   RT-DETR 的输出仅作为 semantic dynamic candidate (语义动态候选),
- *   最终是否判定为动态物体并删除, 必须经过本模块的光流运动验证.
+ *   RT-DETR 的输出仅作为 semantic dynamic candidate (语义动态候选).
+ *   本模块对 MEDIUM 先验(载具)做光流运动验证, 决定是否判为 MOVING_OBJECT.
  *
- * 判定流程:
- *   1. 若 motion_verify/enable=false, 兼容旧逻辑: 候选类别直接视为 MOVING_OBJECT;
+ * 与调用方 (LIVMapper::DetectAndMask) 的分工:
+ *   HIGH 先验 (人/动物) 由调用方直接判 MOVING_OBJECT 并删除, 不进入本模块;
+ *   LOW  先验 (其它)   由调用方 continue 跳过, 不参与删除, 不进入本模块;
+ *   因此 verify() 实际只会收到 MEDIUM, 内部仅使用 medium_prior_thresh.
+ *   (high/low_prior_thresh 为预留参数, 当前不生效, 见 config 注释.)
+ *
+ * 判定流程 (MEDIUM 候选):
+ *   1. 若 motion_verify/enable=false, 兼容旧逻辑: 直接视为 MOVING_OBJECT;
  *   2. 无上一帧图像 -> UNCERTAIN_OBJECT (不删除);
  *   3. 框内可跟踪角点数 < min_track_points -> UNCERTAIN_OBJECT (不删除);
  *   4. 计算 ROI 内光流位移中值 median_roi_flow;
  *   5. 计算背景光流位移中值 median_bg_flow (剔除目标框区域);
  *   6. motion_score = median_roi_flow - median_bg_flow;
- *   7. 按 MotionPrior 分级阈值: HIGH 用低阈值, MEDIUM 用正常阈值, LOW 用高阈值;
- *   8. 超过阈值 -> MOVING_OBJECT, 否则 STATIC_OBJECT.
+ *   7. motion_score > medium_prior_thresh -> MOVING_OBJECT, 否则 STATIC_OBJECT.
  */
 
 #ifndef MOTION_VERIFIER_H
@@ -81,9 +86,9 @@ private:
     cv::Mat prev_gray_;
 
     int min_track_points_ = 12;
-    double high_prior_thresh_ = 1.5;   // 高先验: 低阈值 (更容易判为运动)
-    double medium_prior_thresh_ = 3.0; // 中先验: 正常阈值
-    double low_prior_thresh_ = 5.0;    // 低先验: 高阈值 (默认保留)
+    double medium_prior_thresh_ = 3.0; // 唯一生效的光流阈值 (仅 MEDIUM 进入 verify)
+    double high_prior_thresh_ = 1.5;   // 预留: HIGH 在调用方直接删, 不进入 verify
+    double low_prior_thresh_ = 5.0;    // 预留: LOW 在调用方被跳过, 不进入 verify
 
     // ROI 内光流位移中值, valid_track_num 输出有效跟踪点数
     double computeMedianFlowInBox(

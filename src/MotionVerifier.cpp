@@ -159,12 +159,11 @@ MotionState MotionVerifier::verify(
     double score = roi_med - bg_med;
     motion_score = static_cast<float>(score);
 
-    double thresh = low_prior_thresh_;
-    if (prior == MotionPrior::HIGH) thresh = high_prior_thresh_;
-    else if (prior == MotionPrior::MEDIUM) thresh = medium_prior_thresh_;
-    else thresh = low_prior_thresh_;
+    // 仅 MEDIUM 先验会进入本函数 (HIGH 由调用方直接删, LOW 由调用方跳过),
+    // 故只使用 medium_prior_thresh_; prior 参数保留以维持接口稳定, 实际未使用.
+    (void)prior;
 
-    if (score > thresh) return MotionState::MOVING_OBJECT;
+    if (score > medium_prior_thresh_) return MotionState::MOVING_OBJECT;
     return MotionState::STATIC_OBJECT;
 }
 
