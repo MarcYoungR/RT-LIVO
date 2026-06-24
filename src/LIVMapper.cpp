@@ -15,6 +15,7 @@ which is included as part of this source code package.
 
 #include <opencv2/opencv.hpp>
 #include <ros/ros.h>
+#include <algorithm>
 
 ros::Publisher pub_deleted_points;
 
@@ -215,6 +216,8 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
 
   pub_deleted_points = nh.advertise<sensor_msgs::PointCloud2>("/rtdetr_deleted_points", 100);
 
+  pubRtdetrDebugImg = nh.advertise<sensor_msgs::Image>("/rtdetr_debug_img", 1);
+
   mavros_pose_publisher = nh.advertise<geometry_msgs::PoseStamped>("/mavros/vision_pose/pose", 10);
   pubImage = it.advertise("/rgb_img", 1);
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
@@ -356,6 +359,12 @@ void LIVMapper::handleVIO()
   }
   // -------------------------------------------------------------------
 
+  // 可靠性感知视觉协方差: 在 VIO 更新前设置当前帧视觉协方差
+  // (使用上一帧 total_points 近似; 若 reliability_cov 关闭则不修改 img_point_cov)
+  if (rtdetr_en && reliability_cov_en) {
+      updateVisualReliabilityCovariance();
+  }
+
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
   if (imu_prop_enable) 
@@ -421,36 +430,57 @@ void LIVMapper::handleLIO()
       Eigen::Vector3d T_bc;
       T_bc << VEC_FROM_ARRAY(cameraextrinT);
 
+      // 过滤前: 用当前 body 点云更新每个候选目标的深度中值 (供深度门控使用)
+      updateCandidateDepthFromCloud(feats_down_body);
+
+      int before_num = feats_down_body->points.size();
       int kept_points = 0;
+
+      // 调试图像: 在相机图上叠加 删除点(红) / 保留点(白) / 检测框(按状态着色)
+      int cam_w = vio_manager->cam->width();
+      int cam_h = vio_manager->cam->height();
+      cv::Mat debug_img;
+      bool build_dbg = rtdetr_en && !LidarMeasures.measures.back().img.empty();
+      if (build_dbg) {
+          // 源图缩放到相机模型分辨率, 与 world2cam 投影 (uv) / expanded_box 同坐标系
+          cv::resize(LidarMeasures.measures.back().img, debug_img, cv::Size(cam_w, cam_h));
+          for (const auto& c : semantic_candidates_) {
+              cv::Scalar col(0, 255, 255); // UNCERTAIN=黄
+              if (c.state == MotionState::MOVING_OBJECT)      col = cv::Scalar(0, 0, 255);   // 红
+              else if (c.state == MotionState::STATIC_OBJECT) col = cv::Scalar(0, 255, 0);   // 绿
+              cv::rectangle(debug_img, c.expanded_box, col, 2);
+          }
+      }
 
       for (const auto& pt : feats_down_body->points)
       {
           Eigen::Vector3d p_body(pt.x, pt.y, pt.z);
-
-          // ==========================================
-          // [关键修复] 正确的坐标变换：LiDAR → Camera
-          // ==========================================
-          // Pcl 是 LiDAR 到 Camera 的平移，Rcl 是 LiDAR 到 Camera 的旋转
-          // 原始变换: p_cam = R_bc * p_body + T_bc
           Eigen::Vector3d p_cam = R_bc * p_body + T_bc;
-          // ==========================================
 
           bool keep = true;
+          bool in_front = (p_cam(2) > 0.0);
+          Eigen::Vector2d uv(-1.0, -1.0);
 
-          // [改进] 只要有合理的深度，就检查mask，不再设置最小深度阈值
-          // 这样可以剔除更远处的目标（如墙后的人）
-          if (p_cam(2) > 0.0)  // 放宽深度限制
+          // 动态点判定: 优先 semantic_candidates_ + 深度门控;
+          // 候选为空时回退到 2D mask 逻辑
+          if (in_front)
           {
-              Eigen::Vector2d uv = vio_manager->cam->world2cam(p_cam);
+              uv = vio_manager->cam->world2cam(p_cam);
 
-              if (uv(0) >= 0 && uv(0) < current_mask_.cols &&
-                  uv(1) >= 0 && uv(1) < current_mask_.rows)
-              {
-                  // 检查mask值，0表示动态物体区域
-                  uchar mask_val = current_mask_.at<uchar>((int)uv(1), (int)uv(0));
-                  if (mask_val == 0) {
-                      keep = false;
-                  }
+              if (!semantic_candidates_.empty()) {
+                  if (isDynamicPointByCandidate(p_cam, uv)) keep = false;
+              } else if (uv(0) >= 0 && uv(0) < current_mask_.cols &&
+                         uv(1) >= 0 && uv(1) < current_mask_.rows) {
+                  if (current_mask_.at<uchar>((int)uv(1), (int)uv(0)) == 0) keep = false;
+              }
+          }
+
+          // 在调试图上画点: 白=保留, 红=删除
+          if (build_dbg && in_front) {
+              int u = (int)uv.x(), v = (int)uv.y();
+              if (u >= 0 && u < debug_img.cols && v >= 0 && v < debug_img.rows) {
+                  if (keep) cv::circle(debug_img, cv::Point(u, v), 1, cv::Scalar(255, 255, 255), -1);
+                  else      cv::circle(debug_img, cv::Point(u, v), 2, cv::Scalar(0, 0, 255), -1);
               }
           }
 
@@ -467,6 +497,21 @@ void LIVMapper::handleLIO()
               feats_removed_rgb->points.push_back(pt_rgb);
           }
       }
+
+      // 发布调试图像 (每帧)
+      if (build_dbg && !debug_img.empty()) {
+          cv_bridge::CvImage out;
+          out.header.stamp = ros::Time::now();
+          out.encoding = sensor_msgs::image_encodings::BGR8;
+          out.image = debug_img;
+          pubRtdetrDebugImg.publish(out.toImageMsg());
+      }
+
+      // LIO 动态点过滤统计 (每秒一次)
+      int removed_num = before_num - kept_points;
+      ROS_INFO_THROTTLE(1.0,
+          "[RT-LIVO-LIO] before=%d, after=%d, removed=%d, depth_gate=%s",
+          before_num, kept_points, removed_num, depth_gate_en ? "on" : "off");
 
       // 熔断保护：如果剔除后点云太少，则放弃剔除，防止定位飘飞
       if (feats_down_body->size() > 100 && kept_points < 10) {
@@ -1596,24 +1641,67 @@ void LIVMapper::InitRTDETR(ros::NodeHandle &nh) {
     nh.param<bool>("rtdetr/enable", rtdetr_en, false);
 
     if (rtdetr_en) {
-        // 读取详细参数
+        // 读取基础参数
         nh.param<std::string>("rtdetr/model_name", rtdetr_model_name, "model.onnx");
         nh.param<double>("rtdetr/conf_thresh", rtdetr_conf_thresh, 0.45);
         nh.param<int>("rtdetr/padding", rtdetr_padding, 10);
-        nh.param<double>("rtdetr/time_offset", rtdetr_time_offset, 0.0);  // 读取时间戳偏移参数
+        nh.param<double>("rtdetr/time_offset", rtdetr_time_offset, 0.0);
 
-        // 读取自适应协方差参数
+        // 运动验证参数
+        nh.param<bool>("rtdetr/motion_verify/enable", motion_verify_en, true);
+        nh.param<int>("rtdetr/motion_verify/min_track_points", motion_verify_min_points, 12);
+        nh.param<double>("rtdetr/motion_verify/high_prior_thresh", motion_verify_high_thresh, 1.5);
+        nh.param<double>("rtdetr/motion_verify/medium_prior_thresh", motion_verify_medium_thresh, 3.0);
+        nh.param<double>("rtdetr/motion_verify/low_prior_thresh", motion_verify_low_thresh, 5.0);
+
+        // 运动状态时序平滑
+        nh.param<bool>("rtdetr/motion_verify/temporal_smooth_enable", motion_temporal_smooth_en, true);
+        nh.param<int>("rtdetr/motion_verify/hold_frames", motion_hold_frames, 5);
+        nh.param<double>("rtdetr/motion_verify/assoc_iou_min", assoc_iou_min, 0.3);
+
+        // 自适应 padding 参数
+        nh.param<bool>("rtdetr/adaptive_padding/enable", adaptive_padding_en, true);
+        nh.param<int>("rtdetr/adaptive_padding/min_px", padding_min_px, 4);
+        nh.param<int>("rtdetr/adaptive_padding/max_px", padding_max_px, 40);
+        nh.param<double>("rtdetr/adaptive_padding/base_px", padding_base_px, 3.0);
+        nh.param<double>("rtdetr/adaptive_padding/vmax", padding_vmax, 3.0);
+        nh.param<double>("rtdetr/adaptive_padding/flow_gain", padding_flow_gain, 0.5);
+        nh.param<double>("rtdetr/adaptive_padding/detection_time_delay", detection_time_delay, 0.05);
+
+        // 深度门控参数
+        nh.param<bool>("rtdetr/depth_gate/enable", depth_gate_en, true);
+        nh.param<double>("rtdetr/depth_gate/min", depth_gate_min, 0.3);
+        nh.param<double>("rtdetr/depth_gate/ratio", depth_gate_ratio, 0.12);
+
+        // 旧版自适应协方差 (默认关闭)
         nh.param<bool>("rtdetr/adaptive_cov/enable", adaptive_img_cov_en, false);
         nh.param<double>("rtdetr/adaptive_cov/min_value", adaptive_img_cov_min, 200.0);
         nh.param<double>("rtdetr/adaptive_cov/max_value", adaptive_img_cov_max, 2000.0);
 
-        ROS_INFO("[RT-DETR] time_offset: %.3f seconds", rtdetr_time_offset);
-        ROS_INFO("[RT-DETR] Adaptive Cov: %s (m=0: %.0f, m=1: %.0f)",
-                 adaptive_img_cov_en ? "ENABLED" : "DISABLED",
-                 adaptive_img_cov_min, adaptive_img_cov_max);
+        // 可靠性感知协方差
+        nh.param<bool>("rtdetr/reliability_cov/enable", reliability_cov_en, true);
+        nh.param<double>("rtdetr/reliability_cov/min_value", reliability_cov_min, 200.0);
+        nh.param<double>("rtdetr/reliability_cov/max_value", reliability_cov_max, 2000.0);
+        nh.param<int>("rtdetr/reliability_cov/expected_visual_points", expected_visual_points, 80);
 
-        // 过滤列表：人(0), 自行车(1), 车(2), 摩托(3), 公交(5), 卡车(7)
-        rtdetr_filter_ids = {0, 1, 2, 3, 5, 7};
+        ROS_INFO("[RT-DETR] time_offset: %.3f s", rtdetr_time_offset);
+        ROS_INFO("[RT-DETR] motion_verify: %s (min_pts=%d, H/M/L=%.2f/%.2f/%.2f)",
+                 motion_verify_en ? "ON" : "OFF", motion_verify_min_points,
+                 motion_verify_high_thresh, motion_verify_medium_thresh, motion_verify_low_thresh);
+        ROS_INFO("[RT-DETR] adaptive_padding: %s (min/max=%d/%d)", adaptive_padding_en ? "ON" : "OFF", padding_min_px, padding_max_px);
+        ROS_INFO("[RT-DETR] depth_gate: %s (min=%.2f, ratio=%.2f)", depth_gate_en ? "ON" : "OFF", depth_gate_min, depth_gate_ratio);
+        ROS_INFO("[RT-DETR] reliability_cov: %s (min/max=%.0f/%.0f, exp_pts=%d)",
+                 reliability_cov_en ? "ON" : "OFF", reliability_cov_min, reliability_cov_max, expected_visual_points);
+        ROS_INFO("[RT-DETR] legacy adaptive_cov: %s (deprecated)", adaptive_img_cov_en ? "ON" : "OFF");
+
+        // 创建并配置运动验证器
+        motion_verifier_ = new MotionVerifier();
+        motion_verifier_->configure(
+            motion_verify_en, motion_verify_min_points,
+            motion_verify_high_thresh, motion_verify_medium_thresh, motion_verify_low_thresh);
+
+        // 类别 -> 先验策略统一由 getMotionPrior() 决定 (HIGH直接删 / MEDIUM光流验证 / LOW保留)
+        ROS_INFO("[RT-DETR] policy: HIGH=person+animals(direct del), MEDIUM=vehicles(optflow), LOW=keep");
 
         // 获取模型绝对路径: src/RT-LIVO/weights/model.onnx
         std::string pkg_path = ros::package::getPath("rt_livo");
@@ -1631,139 +1719,305 @@ void LIVMapper::InitRTDETR(ros::NodeHandle &nh) {
     }
 }
 
-/*void LIVMapper::DetectAndMask(const cv::Mat& img) {
-    // 1. 初始化全白 Mask (255 表示保留, 0 表示剔除)
-    current_mask_ = cv::Mat::ones(img.size(), CV_8UC1) * 255;
-
-    if (!rtdetr_en || detector_ == nullptr) return;
-
-    // 2. 推理
-    auto results = detector_->detect(img, rtdetr_conf_thresh);
-
-    // 3. 涂黑动态物体
-    for (const auto& det : results) {
-        bool is_target = false;
-        for (int id : rtdetr_filter_ids) {
-            if (det.class_id == id) { is_target = true; break; }
-        }
-
-        if (is_target) {
-            // 加上 padding
-            int x1 = std::max(0, det.box.x - rtdetr_padding);
-            int y1 = std::max(0, det.box.y - rtdetr_padding);
-            int x2 = std::min(img.cols, det.box.x + det.box.width + rtdetr_padding);
-            int y2 = std::min(img.rows, det.box.y + det.box.height + rtdetr_padding);
-            
-            // 绘制黑色矩形 (0 表示剔除)
-            cv::rectangle(current_mask_, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0), -1);
-        }
-    }
-}*/
-
-void LIVMapper::DetectAndMask(cv::Mat& img)
+void LIVMapper::DetectAndMask(const cv::Mat& img)
 {
+    // 1. 候选列表清空; mask 初始化为全 255 (保留). img 本身绝不修改.
+    semantic_candidates_.clear();
+    if (vio_manager != nullptr && vio_manager->cam != nullptr) {
+        current_mask_ = cv::Mat(vio_manager->cam->height(), vio_manager->cam->width(), CV_8UC1, 255);
+    } else {
+        current_mask_ = cv::Mat(img.size(), CV_8UC1, 255);
+    }
+
+    // rtdetr 关闭或无检测器: 直接返回, 不影响原始 FAST-LIVO2 流程
     if (!rtdetr_en || detector_ == nullptr) return;
 
-    // 获取相机模型的实际尺寸（考虑了scale）
-    int cam_width = vio_manager->cam->width();
-    int cam_height = vio_manager->cam->height();
+    int cam_w = vio_manager->cam->width();
+    int cam_h = vio_manager->cam->height();
+    cv::Rect cam_bounds(0, 0, cam_w, cam_h);
 
-    ROS_DEBUG("[Detect] Input image: %dx%d, Camera model: %dx%d",
-              img.cols, img.rows, cam_width, cam_height);
+    // 检测框从图像空间 -> 相机模型空间 (与 world2cam 投影一致)
+    double sx = (double)cam_w / std::max(1, img.cols);
+    double sy = (double)cam_h / std::max(1, img.rows);
+    auto toCam = [&](const cv::Rect& r) -> cv::Rect {
+        cv::Rect c(cvRound(r.x * sx), cvRound(r.y * sy),
+                   cvRound(r.width * sx), cvRound(r.height * sy));
+        return c & cam_bounds;
+    };
 
-    cv::Mat temp_mask(img.size(), CV_8UC1);
-    temp_mask.setTo(255);
+    ROS_DEBUG("[Detect] img=%dx%d cam=%dx%d", img.cols, img.rows, cam_w, cam_h);
 
+    // 2. RT-DETR 检测 (类别过滤已统一到此, detector 内部不再硬编码类别)
     auto results = detector_->detect(img, rtdetr_conf_thresh);
 
-    int detected_count = 0;
-    for (const auto& det : results) {
-        // ... (过滤ID逻辑不变) ...
-        bool is_target = false;
-        for (int id : rtdetr_filter_ids) { if (det.class_id == id) { is_target = true; break; } }
+    // 3. 逐检测框: 先验分级 -> (HIGH直接删 / MEDIUM光流验证 / LOW保留) -> padding -> 候选保存
+    for (const auto& det : results)
+    {
+        MotionPrior prior = getMotionPrior(det.class_id);
+        if (prior == MotionPrior::LOW) continue;  // 树木/桌椅/其它: 保留, 不参与删除
 
-        if (is_target) {
-            detected_count++;
-            int x1 = std::max(0, det.box.x - rtdetr_padding);
-            int y1 = std::max(0, det.box.y - rtdetr_padding);
-            int x2 = std::min(img.cols, det.box.x + det.box.width + rtdetr_padding);
-            int y2 = std::min(img.rows, det.box.y + det.box.height + rtdetr_padding);
+        SemanticCandidate cand;
+        cand.class_id   = det.class_id;
+        cand.det_score  = det.score;
+        cand.box        = toCam(det.box);   // 相机模型坐标系
+        cand.prior      = prior;
 
-            // 1. 更新 Mask (给 LIO 用)
-            cv::rectangle(temp_mask, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0), -1);
-
-            // 2. [新增修复 3] 把原图的人涂黑 (给 VIO 用)
-            // 这招是釜底抽薪！VIO 在纯黑区域提取不到任何特征点。
-            cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0,0,0), -1);
+        // 分级处置:
+        //   HIGH  (人/动物)         -> 直接判 MOVING, 不经光流验证
+        //   MEDIUM(车/自行车)       -> 光流验证后决定
+        if (cand.prior == MotionPrior::HIGH) {
+            cand.state = MotionState::MOVING_OBJECT;
+            cand.motion_score = 0.0f;
+        } else if (motion_verifier_ != nullptr) {
+            float ms = 0.0f;
+            cand.state = motion_verifier_->verify(img, det.box, cand.prior, ms);
+            cand.motion_score = ms;
+        } else {
+            cand.state = MotionState::UNCERTAIN_OBJECT;
         }
+
+        // 检测阶段无真实深度, 先置 -1; computeAdaptivePadding 内部回退到 5.0
+        cand.median_depth = -1.0f;
+
+        // 自适应 padding (相机模型坐标系像素)
+        cand.adaptive_padding = computeAdaptivePadding((double)cand.median_depth, (double)cand.motion_score);
+
+        cv::Rect eb(cand.box.x - cand.adaptive_padding,
+                    cand.box.y - cand.adaptive_padding,
+                    cand.box.width + 2 * cand.adaptive_padding,
+                    cand.box.height + 2 * cand.adaptive_padding);
+        cand.expanded_box = eb & cam_bounds;
+
+        semantic_candidates_.push_back(cand);
     }
 
-    // ==========================================
-    // [关键修复] 将mask缩放到与相机模型一致的尺寸
-    // ==========================================
-    // world2cam返回的像素坐标是基于cam->width() x cam->height()
-    // 所以mask也需要缩放到相同尺寸
-    cv::Mat temp_mask_resized;
-    if (temp_mask.cols != cam_width || temp_mask.rows != cam_height) {
-        cv::resize(temp_mask, temp_mask_resized, cv::Size(cam_width, cam_height), 0, 0, cv::INTER_NEAREST);
-        ROS_DEBUG("[Detect] Resized mask from %dx%d to %dx%d (camera size)",
-                  temp_mask.cols, temp_mask.rows, cam_width, cam_height);
-    } else {
-        temp_mask_resized = temp_mask;  // 尺寸已匹配，无需缩放
+    // 3.5 时序平滑: 跨帧关联 + MOVING 状态保持, 抑制单帧判定造成的红/绿频繁切换
+    //    (残留根因: 偶尔一帧判 STATIC 就把动态点永久写入地图)
+    applyTemporalSmoothing();
+
+    int moving_num = 0, static_num = 0, uncertain_num = 0;
+    for (const auto& c : semantic_candidates_) {
+        if (c.state == MotionState::MOVING_OBJECT) moving_num++;
+        else if (c.state == MotionState::STATIC_OBJECT) static_num++;
+        else uncertain_num++;
     }
 
-    // 形态学膨胀操作，扩大mask区域，确保覆盖更完整的物体
-    cv::Mat dilated_mask;
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::dilate(temp_mask_resized, dilated_mask, kernel, cv::Point(-1,-1), 2);  // 膨胀2次
+    // 4. 仅对 MOVING_OBJECT 的 expanded_box 在 mask 上画 0
+    for (const auto& cand : semantic_candidates_) {
+        if (cand.state != MotionState::MOVING_OBJECT) continue;
+        cv::rectangle(current_mask_, cand.expanded_box, cv::Scalar(0), -1);
+    }
 
-    current_mask_ = dilated_mask;
-    // ==========================================
-
-    // ==========================================
-    // 【自适应 img_point_cov 计算】
-    // ==========================================
-    if (adaptive_img_cov_en && vio_manager != nullptr) {
-        // 计算 mask 中值为 0（动态区域）的像素数
-        cv::Mat dynamic_mask = (current_mask_ == 0);
-        int dynamic_pixels = cv::countNonZero(dynamic_mask);
-        int total_pixels = current_mask_.rows * current_mask_.cols;
-
-        // 计算面积比例 m = x / A
-        double m = static_cast<double>(dynamic_pixels) / total_pixels;
-
-        // 计算自适应协方差
-        // 使用对数函数: img_point_cov = min + (max - min) × log(1 + 100m) / log(101)
-        // 当 m=0 时: log(1) = 0 → img_point_cov = min
-        // 当 m=1 时: log(101) ≈ 4.615 → img_point_cov = max
-        double adaptive_cov;
+    // 5. 旧版自适应协方差 (默认关闭; 与 reliability_cov 互斥, reliability 优先)
+    if (adaptive_img_cov_en && !reliability_cov_en && vio_manager != nullptr) {
+        int dyn_px = cv::countNonZero(current_mask_ == 0);
+        int tot_px = std::max(1, current_mask_.rows * current_mask_.cols);
+        double m = (double)dyn_px / tot_px;
+        double cov;
         if (m <= 0.0) {
-            // 无动态目标，使用最小值
-            adaptive_cov = adaptive_img_cov_min;
+            cov = adaptive_img_cov_min;
         } else {
-            // 对数函数平滑过渡
-            double log_factor = std::log10(1.0 + 100.0 * m);
-            double log_max = std::log10(101.0);  // ≈ 2.0043
-            double normalized = log_factor / log_max;  // 归一化到 [0, 1]
+            double norm = std::log10(1.0 + 100.0 * m) / std::log10(101.0);
+            cov = adaptive_img_cov_min + (adaptive_img_cov_max - adaptive_img_cov_min) * norm;
+        }
+        vio_manager->img_point_cov = cov;
+    }
 
-            // 线性插值: min + (max - min) × normalized
-            adaptive_cov = adaptive_img_cov_min + (adaptive_img_cov_max - adaptive_img_cov_min) * normalized;
+    // 6. 候选统计日志 (每秒一次, 便于实验/论文记录)
+    double mask_ratio = 0.0;
+    if (!current_mask_.empty()) {
+        int dyn_px = cv::countNonZero(current_mask_ == 0);
+        int tot_px = std::max(1, current_mask_.rows * current_mask_.cols);
+        mask_ratio = (double)dyn_px / tot_px;
+    }
+    ROS_INFO_THROTTLE(1.0,
+        "[RT-LIVO] candidates=%zu, moving=%d, static=%d, uncertain=%d, mask_ratio=%.3f, img_cov=%.2f",
+        semantic_candidates_.size(), moving_num, static_num, uncertain_num, mask_ratio,
+        vio_manager ? vio_manager->img_point_cov : -1.0);
+
+    // 7. 缓存当前帧灰度, 供下一帧运动验证使用
+    if (motion_verifier_ != nullptr) {
+        motion_verifier_->updatePreviousFrame(img);
+    }
+}
+
+// ==========================================
+// 运动状态时序平滑: 跨帧 IoU 关联 + MOVING 状态保持
+//   一旦某目标被判过 MOVING, 在 hold_frames 内即使单帧抖动到 STATIC/UNCERTAIN
+//   也仍按 MOVING 处理 (持续删除), 从根源上消除红/绿频繁切换造成的地图残留.
+// ==========================================
+void LIVMapper::applyTemporalSmoothing()
+{
+    auto IoU = [](const cv::Rect& a, const cv::Rect& b) -> double {
+        cv::Rect inter = a & b;
+        if (inter.area() <= 0) return 0.0;
+        double uni = (double)a.area() + (double)b.area() - (double)inter.area();
+        return uni > 0.0 ? (double)inter.area() / uni : 0.0;
+    };
+
+    // 关闭时: 仅初始化 hold 计数, 不做跨帧关联
+    if (!motion_temporal_smooth_en || tracked_candidates_.empty()) {
+        for (auto& c : semantic_candidates_) {
+            c.moving_hold_frames = (c.state == MotionState::MOVING_OBJECT) ? motion_hold_frames : 0;
+        }
+        tracked_candidates_ = semantic_candidates_;
+        return;
+    }
+
+    std::vector<bool> matched_tracked(tracked_candidates_.size(), false);
+
+    for (auto& c : semantic_candidates_) {
+        MotionState raw = c.state;  // 本帧运动验证原始结果
+
+        // 在上一帧候选中找同类、IoU 最大的匹配
+        int best_idx = -1;
+        double best_iou = 0.0;
+        for (size_t i = 0; i < tracked_candidates_.size(); ++i) {
+            if (matched_tracked[i] || tracked_candidates_[i].class_id != c.class_id) continue;
+            double iou = IoU(tracked_candidates_[i].box, c.box);
+            if (iou > best_iou) { best_iou = iou; best_idx = (int)i; }
         }
 
-        // 更新 vio_manager 的 img_point_cov
-        vio_manager->img_point_cov = adaptive_cov;
-    }
-    // ==========================================
-
-    // [调试日志] 确认 Mask 真的不是全黑
-    // 计算 Mask 的平均值，如果是 0，说明全黑了
-    if (detected_count > 0) {
-        double mean_val = cv::mean(current_mask_)[0];
-        if (mean_val < 1.0) {
-            ROS_ERROR("[Detect] CRITICAL: Mask became fully BLACK! Initialization failed.");
+        if (best_idx >= 0 && best_iou >= assoc_iou_min) {
+            matched_tracked[best_idx] = true;
+            int& hold = tracked_candidates_[best_idx].moving_hold_frames;
+            if (raw == MotionState::MOVING_OBJECT) {
+                hold = motion_hold_frames;          // 重新充满保持窗口
+                c.state = MotionState::MOVING_OBJECT;
+            } else if (hold > 0) {
+                hold--;                             // 保持窗口内: 仍按 MOVING 删除
+                c.state = MotionState::MOVING_OBJECT;
+            } else {
+                c.state = raw;                      // 保持窗口耗尽且本帧确实静止
+            }
+            c.moving_hold_frames = hold;
         } else {
-            ROS_WARN_THROTTLE(1.0, "[Detect] Found %d targets. Mask mean val: %.2f (should be close to 255), size: %dx%d",
-                             detected_count, mean_val, current_mask_.rows, current_mask_.cols);
+            // 新目标 (上一帧未见): 直接采用本帧判定
+            c.moving_hold_frames = (raw == MotionState::MOVING_OBJECT) ? motion_hold_frames : 0;
+            c.state = raw;
         }
     }
+
+    // 更新跟踪记忆为当前帧 (框已更新到当前位置, hold 计数随之延续)
+    tracked_candidates_ = semantic_candidates_;
+}
+
+// ==========================================
+// 自适应 padding: 深度/时间延迟 + 运动得分
+// ==========================================
+int LIVMapper::computeAdaptivePadding(double median_depth, double motion_score)
+{
+    if (!adaptive_padding_en || vio_manager == nullptr || vio_manager->cam == nullptr) {
+        return rtdetr_padding;
+    }
+
+    double fx = vio_manager->cam->fx();
+    double z = median_depth > 0.3 ? median_depth : 5.0;  // 无真实深度时回退 5.0
+
+    double dt = std::max(0.0, rtdetr_time_offset + detection_time_delay);
+
+    // 物体在检测/传输延迟内可能的像素位移 (近似)
+    double depth_padding = fx * padding_vmax * dt / std::max(z, 0.5);
+    // 光流残差带来的额外 padding
+    double motion_padding = padding_flow_gain * std::max(0.0, motion_score);
+
+    int pad = static_cast<int>(padding_base_px + depth_padding + motion_padding);
+    pad = std::max(padding_min_px, std::min(padding_max_px, pad));
+    return pad;
+}
+
+// ==========================================
+// 基于语义候选 + 深度门控判断 LiDAR 点是否为动态点
+// ==========================================
+bool LIVMapper::isDynamicPointByCandidate(const Eigen::Vector3d& p_cam, const Eigen::Vector2d& uv)
+{
+    for (const auto& obj : semantic_candidates_) {
+        if (obj.state != MotionState::MOVING_OBJECT) continue;
+
+        if (!obj.expanded_box.contains(cv::Point((int)uv.x(), (int)uv.y()))) continue;
+
+        // 深度门控: 点深度需与目标 median_depth 一致; 关闭时仅用 2D 框
+        if (depth_gate_en && obj.median_depth > 0.0) {
+            double gate = depth_gate_min + depth_gate_ratio * obj.median_depth;
+            if (std::abs(p_cam.z() - obj.median_depth) > gate) continue;
+        }
+
+        return true;
+    }
+    return false;
+}
+
+// ==========================================
+// LIO 过滤前: 用 body 点云更新每个候选目标的深度中值
+// ==========================================
+void LIVMapper::updateCandidateDepthFromCloud(const PointCloudXYZI::Ptr& cloud_body)
+{
+    if (cloud_body == nullptr || cloud_body->empty()) return;
+    if (vio_manager == nullptr || vio_manager->cam == nullptr) return;
+
+    Eigen::Matrix3d R_bc;
+    R_bc << MAT_FROM_ARRAY(cameraextrinR);
+    Eigen::Vector3d T_bc;
+    T_bc << VEC_FROM_ARRAY(cameraextrinT);
+
+    for (auto& obj : semantic_candidates_) {
+        std::vector<double> depths;
+
+        for (const auto& pt : cloud_body->points) {
+            Eigen::Vector3d p_body(pt.x, pt.y, pt.z);
+            Eigen::Vector3d p_cam = R_bc * p_body + T_bc;
+            if (p_cam.z() <= 0.0) continue;
+
+            Eigen::Vector2d uv = vio_manager->cam->world2cam(p_cam);
+            if (obj.box.contains(cv::Point((int)uv.x(), (int)uv.y()))) {
+                depths.push_back(p_cam.z());
+            }
+        }
+
+        if (!depths.empty()) {
+            std::nth_element(depths.begin(), depths.begin() + depths.size() / 2, depths.end());
+            obj.median_depth = static_cast<float>(depths[depths.size() / 2]);
+        }
+    }
+}
+
+// ==========================================
+// 可靠性感知视觉协方差: 基于有效视觉约束质量而非动态目标面积
+// ==========================================
+void LIVMapper::updateVisualReliabilityCovariance()
+{
+    if (!reliability_cov_en || vio_manager == nullptr) return;
+
+    // 注: 此处 total_points 为上一帧 processFrame 的结果 (本帧尚未更新), 属可接受近似
+    int valid_visual_points = vio_manager->total_points;
+    double valid_ratio = static_cast<double>(valid_visual_points) /
+                         std::max(1, expected_visual_points);
+    valid_ratio = std::max(0.0, std::min(1.0, valid_ratio));
+
+    double moving_pixels = 0.0;
+    double uncertain_pixels = 0.0;
+    double total_pixels = current_mask_.empty() ? 1.0 :
+                          (double)current_mask_.rows * current_mask_.cols;
+
+    for (const auto& obj : semantic_candidates_) {
+        double area = static_cast<double>(obj.expanded_box.area());
+        if (obj.state == MotionState::MOVING_OBJECT) moving_pixels += area;
+        if (obj.state == MotionState::UNCERTAIN_OBJECT) uncertain_pixels += area;
+    }
+
+    double moving_ratio = std::max(0.0, std::min(1.0, moving_pixels / total_pixels));
+    double uncertain_ratio = std::max(0.0, std::min(1.0, uncertain_pixels / total_pixels));
+
+    // 视觉约束质量: 有效点越多越好, 不确定/运动区域越少越好
+    double visual_quality =
+        0.6 * valid_ratio +
+        0.3 * (1.0 - uncertain_ratio) +
+        0.1 * (1.0 - moving_ratio);
+    visual_quality = std::max(0.0, std::min(1.0, visual_quality));
+
+    // 质量越低, 协方差越大 (视觉约束越不可信)
+    double cov = reliability_cov_min +
+                 (reliability_cov_max - reliability_cov_min) * (1.0 - visual_quality);
+
+    vio_manager->img_point_cov = cov;
 }

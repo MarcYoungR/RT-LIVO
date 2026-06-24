@@ -103,12 +103,8 @@ std::vector<Detection> RTDETRDetector::detect(const cv::Mat& image, float conf_t
         float score = scores_ptr[i];
         int label = static_cast<int>(labels_ptr[i]);
 
-        // 过滤: 置信度 + 类别 (0=Person, 2=Car, 5=Bus, 7=Truck)
-        if (score > conf_threshold && (label == 0 || label == 2 || label == 5 || label == 7)) {
-            // RT-DETRv2 导出的 boxes 已经是绝对坐标 [x1, y1, x2, y2]
-            // 或者是 [cx, cy, w, h]，具体取决于导出配置，v2 默认通常是绝对坐标 [x1, y1, x2, y2]
-            
-            // 指针偏移: boxes 是 [300, 4]，所以每个 query 占 4 个 float
+        // 仅按置信度过滤; 类别过滤统一交由 LIVMapper::DetectAndMask 处理
+        if (score > conf_threshold) {
             const float* box = boxes_ptr + i * 4;
             float x1 = box[0];
             float y1 = box[1];
@@ -116,10 +112,9 @@ std::vector<Detection> RTDETRDetector::detect(const cv::Mat& image, float conf_t
             float y2 = box[3];
 
             Detection det;
-            // 转换为 cv::Rect (x, y, w, h)
-            det.box = cv::Rect(static_cast<int>(x1), static_cast<int>(y1), 
+            det.box = cv::Rect(static_cast<int>(x1), static_cast<int>(y1),
                                static_cast<int>(x2 - x1), static_cast<int>(y2 - y1));
-            
+
             // 边界保护
             det.box &= cv::Rect(0, 0, image.cols, image.rows);
 

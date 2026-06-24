@@ -17,6 +17,7 @@ which is included as part of this source code package.
 #include "vio.h"
 #include "preprocess.h"
 #include "RTDETRDetector.h"
+#include "MotionVerifier.h"
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
@@ -177,6 +178,7 @@ public:
   ros::Publisher pubLaserCloudDynRmed;
   ros::Publisher pubLaserCloudDynDbg;
   image_transport::Publisher pubImage;
+  ros::Publisher pubRtdetrDebugImg;     // 调试图像: 相机图上叠加 红点(删除)/白点(保留)/检测框
   ros::Publisher mavros_pose_publisher;
   ros::Timer imu_prop_timer;
 
@@ -187,26 +189,80 @@ public:
   bool colmap_output_en = false;
 
   RTDETRDetector* detector_ = nullptr;
-  
+
+  // 运动验证模块 (RT-DETR 输出 -> 语义动态候选 -> 运动验证)
+  MotionVerifier* motion_verifier_ = nullptr;
+
+  // 语义动态候选列表 (相机模型坐标系)
+  std::vector<SemanticCandidate> semantic_candidates_;
+  // 上一帧候选 (用于跨帧关联 + 时序状态保持)
+  std::vector<SemanticCandidate> tracked_candidates_;
+
   // 掩码图像 (0=动态/剔除, 255=静态/保留)
   cv::Mat current_mask_;
 
   // --- 配置参数 (将在 YAML 中读取) ---
-  bool rtdetr_en = false;              // 开关 (对应 yaml: rtdetr_en)
-  double rtdetr_conf_thresh = 0.45;    // 阈值 (对应 yaml: rtdetr_conf_thresh)
-  int rtdetr_padding = 10;             // 膨胀像素 (对应 yaml: rtdetr_padding)
-  std::string rtdetr_model_name;       // 模型名 (对应 yaml: rtdetr_model_name)
-  std::vector<int> rtdetr_filter_ids;  // 过滤类别列表
-  double rtdetr_time_offset = 0.0;    // 【新增】时间戳偏移(秒)，用于对齐/cloud_registered的延迟
+  bool rtdetr_en = false;              // 开关 (对应 yaml: rtdetr/enable)
+  double rtdetr_conf_thresh = 0.45;    // 阈值 (对应 yaml: rtdetr/conf_thresh)
+  int rtdetr_padding = 10;             // 固定 padding (fallback)
+  std::string rtdetr_model_name;       // 模型名 (对应 yaml: rtdetr/model_name)
+  double rtdetr_time_offset = 0.0;     // 时间戳偏移(秒)
 
-  // --- 自适应 img_point_cov 参数 ---
-  bool adaptive_img_cov_en = false;         // 是否启用自适应调整
-  double adaptive_img_cov_min = 200.0;      // 无动态目标时的值 (m=0)
-  double adaptive_img_cov_max = 2000.0;     // 全覆盖时的值 (m=1)
+  // --- 运动验证参数 (motion_verify) ---
+  bool motion_verify_en = true;
+  int  motion_verify_min_points = 12;
+  double motion_verify_high_thresh = 1.5;
+  double motion_verify_medium_thresh = 3.0;
+  double motion_verify_low_thresh = 5.0;
+
+  // --- 运动状态时序平滑 (抑制红/绿框频繁切换导致的地图残留) ---
+  bool   motion_temporal_smooth_en = true; // 跨帧关联 + MOVING 状态保持
+  int    motion_hold_frames = 5;           // 判过 MOVING 后持续保持的帧数
+  double assoc_iou_min = 0.3;              // 跨帧候选匹配的 IoU 下限
+
+  // --- 自适应 padding 参数 (adaptive_padding) ---
+  bool   adaptive_padding_en = true;
+  int    padding_min_px = 4;
+  int    padding_max_px = 40;
+  double padding_base_px = 3.0;
+  double padding_vmax = 3.0;
+  double padding_flow_gain = 0.5;
+  double detection_time_delay = 0.05;
+
+  // --- 深度门控参数 (depth_gate) ---
+  bool   depth_gate_en = true;
+  double depth_gate_min = 0.3;
+  double depth_gate_ratio = 0.12;
+
+  // --- 旧版自适应协方差 (adaptive_cov, 已弃用为默认关闭) ---
+  bool adaptive_img_cov_en = false;
+  double adaptive_img_cov_min = 200.0;
+  double adaptive_img_cov_max = 2000.0;
+
+  // --- 可靠性感知协方差 (reliability_cov) ---
+  bool   reliability_cov_en = true;
+  double reliability_cov_min = 200.0;
+  double reliability_cov_max = 2000.0;
+  int    expected_visual_points = 80;
 
   // --- 功能函数 ---
   void InitRTDETR(ros::NodeHandle &nh);   // 初始化：读取YAML并加载模型
-  void DetectAndMask(cv::Mat& img); // 核心：执行检测并生成Mask
+  void DetectAndMask(const cv::Mat& img); // 核心：检测 + 运动验证 + 生成Mask (不修改原图)
+
+  // 自适应 padding: 综合深度 / 时间延迟 / 运动得分
+  int computeAdaptivePadding(double median_depth, double motion_score);
+
+  // 基于语义候选 + 深度门控判断一个 LiDAR 点是否为动态点
+  bool isDynamicPointByCandidate(const Eigen::Vector3d& p_cam, const Eigen::Vector2d& uv);
+
+  // LIO 过滤前, 用当前 body 点云更新每个候选目标的深度中值
+  void updateCandidateDepthFromCloud(const PointCloudXYZI::Ptr& cloud_body);
+
+  // 可靠性感知的视觉协方差更新
+  void updateVisualReliabilityCovariance();
+
+  // 运动状态时序平滑: 跨帧 IoU 关联 + MOVING 状态保持, 抑制单帧闪烁
+  void applyTemporalSmoothing();
   // ==========================================
 
 };

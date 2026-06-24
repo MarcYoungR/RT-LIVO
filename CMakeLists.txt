@@ -127,7 +127,7 @@ add_library(imu_proc src/IMU_Processing.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
 
 # Add the main executable
-add_executable(rtlivo_mapping src/main.cpp src/RTDETRDetector.cpp)
+add_executable(rtlivo_mapping src/main.cpp src/RTDETRDetector.cpp src/MotionVerifier.cpp)
 
 # Link libraries to the executable
 target_link_libraries(rtlivo_mapping

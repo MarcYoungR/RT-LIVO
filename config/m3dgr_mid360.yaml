@@ -1,18 +1,19 @@
 common:
   img_topic: "/camera/color/image_raw"
-  lid_topic: "/livox/lidar"
-  imu_topic: "/livox/imu"
+  lid_topic: "/livox/mid360/lidar"
+  imu_topic: "/livox/mid360/imu"
   img_en: 1
   lidar_en: 1
   ros_driver_bug_fix: false
 
 extrin_calib:
-  extrinsic_T: [0.04165, 0.02326, -0.0284]
+  extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  Rcl: [-0.0300215,-0.990732,0.132475,
-        0.00477201,-0.132675,-0.991148,
-        0.999538,-0.0291236,0.00871089] 
-  Pcl: [-0.0828877, 0.13802,0.0133933]
+  # LidarToCamera 
+  Rcl: [0.0722207,  -0.997387, -0.0020542,
+        0.521005,   0.039482,  -0.85264,
+        0.850493,  0.060508,   0.522494] 
+  Pcl: [-0.0442358, -0.411712, 0.168568]
 
 time_offset: 
   imu_time_offset: 0.0
@@ -23,8 +24,8 @@ preprocess:
   point_filter_num: 1
   filter_size_surf: 0.1
   lidar_type: 1 # Livox Avia LiDAR
-  scan_line: 6
-  blind: 0.8
+  scan_line: 4
+  blind: 1.0
 
 vio:
   max_iterations: 5
@@ -66,29 +67,28 @@ uav:
   gravity_align_en: false
 
 publish:
-  dense_map_en: true   # 【关键】启用密集地图，显示完整点云
-
-  pub_effect_point_en: false
+  dense_map_en: true
+  pub_effect_point_en: false 
   pub_plane_en: false
   pub_scan_num: 1
   blind_rgb_points: 0.0
 
 evo:
-  seq_name: "206_01"
+  seq_name: "Dynamic04"
   pose_output_en: true
 
 pcd_save:
-  pcd_save_en: true     # 【启用PCD保存】设置为 true 即可保存点云地图
-  colmap_output_en: false
+  pcd_save_en: true
+  colmap_output_en: false # need to set interval = -1
   filter_size_pcd: 0.15
-  interval: -1  
+  interval: -1 
 
 rtdetr:
-  enable: true              # 总开关; false 时系统行为等同原始 FAST-LIVO2
-  model_name: "model.onnx"  # 模型文件名 (weights 文件夹下)
-  conf_thresh: 0.6         # 检测置信度阈值
-  padding: 10               # 固定 padding (adaptive_padding 关闭时回退使用)
-  time_offset: 0.0          # 检测/发布时间戳偏移 (秒)
+  enable: true               # 总开关; false 时系统行为等同原始 FAST-LIVO2
+  model_name: "model.onnx"   # 模型文件名 (weights 文件夹下)
+  conf_thresh: 0.6           # 检测置信度阈值
+  padding: 20                # 固定 padding (adaptive_padding 关闭时回退使用)
+  time_offset: 0.0           # 检测/发布时间戳偏移 (秒)
 
   # 运动验证 + 分级处置策略:
   #   HIGH   人(person)/动物(bird..giraffe)  -> 直接删除, 不经光流验证
@@ -101,10 +101,9 @@ rtdetr:
     medium_prior_thresh: 3.0     # MEDIUM(载具)光流运动阈值 (HIGH/LOW 不走光流)
     high_prior_thresh: 1.5       # 预留(HIGH当前直接删, 不使用光流阈值)
     low_prior_thresh: 5.0        # 预留(LOW当前直接保留, 不使用光流阈值)
-
     # 时序平滑: 抑制单帧判定造成的红/绿框频繁切换 (残留根因)
     temporal_smooth_enable: true # 跨帧 IoU 关联 + MOVING 状态保持
-    hold_frames: 5               # 判过 MOVING 后持续保持的帧数 (10Hz 约 0.5s); 越大越稳但越易过删
+    hold_frames: 5               # 判过 MOVING 后持续保持的帧数 (10Hz 约 0.5s)
     assoc_iou_min: 0.3           # 跨帧候选匹配的 IoU 下限
 
   # 自适应 padding: 由深度/时间延迟/运动得分决定, 取代固定 padding
