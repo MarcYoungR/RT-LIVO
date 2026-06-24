@@ -6,6 +6,7 @@
 
 ### 📢 News
 
+- 🚀 **2026-06-24**: Motion-verifier based dynamic object removal pipeline + M3DGR dataset support.
 - 🔓 **2025-01-23**: Code released!
 - 🎉 **2024-10-01**: FAST-LIVO2 accepted by **T-RO '24**!
 
@@ -50,17 +51,29 @@ The [**FAST-Calib**](https://github.com/hku-mars/FAST-Calib) toolkit is recommen
 
 ### 1.6 RT-DETR Integration
 
-This version integrates RT-DETR (Real-Time Detection Transformer) for dynamic object detection:
+This version integrates RT-DETR (Real-Time Detection Transformer) for dynamic object detection and removal:
 
-- **Model**: RT-DETR ONNX model (place in `weights/` directory)
-- **Configuration**: See `config/avia.yaml` for RT-DETR parameters
-- **Key Features**:
-  - Real-time object detection from camera images
-  - Dynamic point cloud filtering based on detection masks
-  - Configurable confidence threshold and padding
-  - Support for filtering specific object classes
+- **Model**: RT-DETRv2 ONNX model (placed in `weights/`), accelerated via ONNX Runtime with CUDA.
+- **Configuration**: see the `rtdetr:` block in `config/avia.yaml` or `config/m3dgr_mid360.yaml`.
 
-**Note**: Proper extrinsic calibration between LiDAR and camera is critical for accurate point cloud projection. Use FAST-Calib or similar tools for calibration.
+#### Removal pipeline
+
+Detection results are treated only as *semantic dynamic candidates*. Every candidate passes through a multi-stage pipeline before any point is deleted:
+
+1. **RT-DETR detection** — bounding boxes + confidence from camera images.
+2. **Tiered class prior** — each COCO class is assigned a motion prior:
+   - `HIGH` — people / animals (`person` + `bird..giraffe`, 11 classes) → removed directly.
+   - `MEDIUM` — vehicles (`bicycle/car/motorcycle/airplane/bus/train/truck/boat`, 8 classes) → verified by optical flow, removed only if moving.
+   - `LOW` — everything else (61 classes) → kept.
+3. **Optical-flow motion verification** — ROI vs. background flow median; too few trackable corners → `UNCERTAIN` (kept).
+4. **Depth gating** — a point is removed only if it falls inside a box *and* its depth matches the object.
+5. **Temporal smoothing** — cross-frame IoU association + `MOVING` state hold suppress single-frame flicker.
+6. **Adaptive padding** — box expansion driven by depth / time-delay / motion score.
+7. **Reliability-aware visual covariance** — down-weights the visual constraint when dynamic regions dominate.
+
+Setting `rtdetr/enable: false` disables the whole pipeline and the system falls back to plain FAST-LIVO2.
+
+**Note**: proper LiDAR-camera extrinsic calibration (`Rcl`/`Pcl`) is critical for accurate point projection. Use [FAST-Calib](https://github.com/hku-mars/FAST-Calib) or similar tools.
 
 ## 2. Prerequisites
 
@@ -153,12 +166,23 @@ Pcl: [translation_vector_elements]
 
 ### 4.3 Launch the System
 
+#### FAST-LIVO2 dataset (Livox Avia)
+
 Download our collected rosbag files via OneDrive ([**FAST-LIVO2-Dataset**](https://connecthkuhk-my.sharepoint.com/:f:/g/personal/zhengcr_connect_hku_hk/ErdFNQtjMxZOorYKDTtK4ugBkogXfq1OfDm90GECouuIQA?e=KngY9Z)).
 
 ```
 roslaunch rt_livo mapping_avia.launch
 rosbag play YOUR_DOWNLOADED.bag
 ```
+
+#### M3DGR dataset (Livox Mid-360)
+
+```
+roslaunch rt_livo mapping_m3dgr.launch
+rosbag play YOUR_DOWNLOADED.bag
+```
+
+Make sure the rosbag topic names match the `common:` block of the corresponding config (`lid_topic` / `imu_topic` / `img_topic`), and that the LiDAR-camera extrinsic (`Rcl`/`Pcl`) and camera intrinsics are calibrated for your own sensor.
 
 
 ## 5. License
